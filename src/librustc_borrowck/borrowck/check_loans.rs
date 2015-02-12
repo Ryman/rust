@@ -220,6 +220,12 @@ enum UseError<'tcx> {
     UseWhileBorrowed(/*loan*/Rc<LoanPath<'tcx>>, /*loan*/Span)
 }
 
+#[derive(Debug)]
+enum AssignError {
+    Moved,
+    PartialReinit
+}
+
 fn compatible_borrow_kinds(borrow_kind1: ty::BorrowKind,
                            borrow_kind2: ty::BorrowKind)
                            -> bool {
@@ -690,6 +696,33 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
         return ret;
     }
 
+    fn report_if_path_is_moved(&self,
+                      id: ast::NodeId,
+                      span: Span,
+                      use_kind: MovedValueUseKind,
+                      lp: &Rc<LoanPath<'tcx>>,
+                      err_kind: AssignError) {
+        use self::AssignError::*;
+        debug!("report_if_moved(id={}, use_kind={:?}, lp={}, err_kind={:?})",
+               id, use_kind, lp.repr(self.bccx.tcx), err_kind);
+
+        let base_lp = owned_ptr_base_path_rc(lp);
+        self.move_data.each_move_of(id, &base_lp, |the_move, moved_lp| {
+            match err_kind {
+                Moved => self.bccx.report_use_of_moved_value(
+                                 span, use_kind, &**lp, the_move, moved_lp, self.param_env),
+                PartialReinit => {
+                    self.bccx
+                        .report_partial_reinitialization_of_uninitialized_structure(
+                            span, &*lp)
+                }
+            };
+
+            false
+        });
+
+    }
+
     /// Reports an error if `expr` (which should be a path)
     /// is using a moved/uninitialized value
     fn check_if_path_is_moved(&self,
@@ -697,19 +730,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                               span: Span,
                               use_kind: MovedValueUseKind,
                               lp: &Rc<LoanPath<'tcx>>) {
-        debug!("check_if_path_is_moved(id={}, use_kind={:?}, lp={})",
-               id, use_kind, lp.repr(self.bccx.tcx));
-        let base_lp = owned_ptr_base_path_rc(lp);
-        self.move_data.each_move_of(id, &base_lp, |the_move, moved_lp| {
-            self.bccx.report_use_of_moved_value(
-                span,
-                use_kind,
-                &**lp,
-                the_move,
-                moved_lp,
-                self.param_env);
-            false
-        });
+        self.report_if_path_is_moved(id, span, use_kind, lp, AssignError::Moved);
     }
 
     /// Reports an error if assigning to `lp` will use a
@@ -747,19 +768,13 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
             LpExtend(ref lp_base, _, LpInterior(InteriorField(_))) => {
                 match lp_base.to_type().sty {
                     ty::ty_struct(def_id, _) | ty::ty_enum(def_id, _) => {
+                        // In the case where the owner implements drop, then
+                        // the path must be initialized to prevent a case of
+                        // partial reinitialization
                         if ty::has_dtor(self.tcx(), def_id) {
-                            // In the case where the owner implements drop, then
-                            // the path must be initialized to prevent a case of
-                            // partial reinitialization
-                            let loan_path = owned_ptr_base_path_rc(lp_base);
-                            self.move_data.each_move_of(id, &loan_path, |_, _| {
-                                self.bccx
-                                    .report_partial_reinitialization_of_uninitialized_structure(
-                                        span,
-                                        &*loan_path);
-                                false
-                            });
-                            return;
+                            return self.report_if_path_is_moved(id, span,
+                                                                use_kind, lp_base,
+                                                                AssignError::PartialReinit);
                         }
                     },
                     _ => {},
